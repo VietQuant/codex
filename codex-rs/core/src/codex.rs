@@ -1497,12 +1497,17 @@ async fn submission_loop(
             Op::ListCustomPrompts => {
                 let sub_id = sub.id.clone();
 
-                let custom_prompts: Vec<CustomPrompt> =
-                    if let Some(dir) = crate::custom_prompts::default_prompts_dir() {
-                        crate::custom_prompts::discover_prompts_in(&dir).await
-                    } else {
-                        Vec::new()
-                    };
+                let custom_prompts: Vec<CustomPrompt> = {
+                    let cwd =
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    let personal = crate::custom_prompts::default_prompts_dir();
+                    // Exclude built-ins (if any) on discovery. For now, no extra excludes.
+                    let exclude = std::collections::HashSet::new();
+                    crate::custom_prompts::discover_project_and_personal_prompts(
+                        &cwd, &exclude, personal,
+                    )
+                    .await
+                };
 
                 let event = Event {
                     id: sub_id,

@@ -1,5 +1,5 @@
 use codex_protocol::custom_prompts::CustomPrompt;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::path::PathBuf;
 use tokio::fs;
@@ -73,6 +73,38 @@ pub async fn discover_prompts_in_excluding(
     out
 }
 
+/// Return the project prompts directory for a given project root: `<root>/.codex/prompts`.
+pub fn project_prompts_dir(root: &Path) -> PathBuf {
+    root.join(".codex").join("prompts")
+}
+
+/// Discover prompts from the project directory and the personal directory, merging them
+/// with project prompts taking precedence over personal prompts on name collisions.
+/// Results are sorted by name.
+pub async fn discover_project_and_personal_prompts(
+    project_root: &Path,
+    exclude: &HashSet<String>,
+    personal_dir: Option<PathBuf>,
+) -> Vec<CustomPrompt> {
+    let project_dir = project_prompts_dir(project_root);
+    let mut by_name: HashMap<String, CustomPrompt> = HashMap::new();
+
+    // Project prompts first (higher precedence)
+    for p in discover_prompts_in_excluding(&project_dir, exclude).await {
+        by_name.insert(p.name.clone(), p);
+    }
+    // Then personal prompts, only if not already present
+    if let Some(dir) = personal_dir.as_deref() {
+        for p in discover_prompts_in_excluding(dir, exclude).await {
+            by_name.entry(p.name.clone()).or_insert(p);
+        }
+    }
+
+    let mut out: Vec<CustomPrompt> = by_name.into_values().collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +155,38 @@ mod tests {
         let found = discover_prompts_in(dir).await;
         let names: Vec<String> = found.into_iter().map(|e| e.name).collect();
         assert_eq!(names, vec!["good"]);
+    }
+
+    #[tokio::test]
+    async fn project_overrides_personal_and_merges() {
+        let tmp = tempdir().expect("create TempDir");
+        let root = tmp.path();
+        let proj_dir = project_prompts_dir(root);
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        // project: shared.md overrides, and x.md unique
+        fs::write(proj_dir.join("shared.md"), b"project").unwrap();
+        fs::write(proj_dir.join("x.md"), b"x").unwrap();
+
+        // personal: shared.md (should be ignored), and y.md unique
+        let personal = root.join("personal");
+        std::fs::create_dir_all(&personal).unwrap();
+        fs::write(personal.join("shared.md"), b"personal").unwrap();
+        fs::write(personal.join("y.md"), b"y").unwrap();
+
+        let exclude = HashSet::new();
+        let found = discover_project_and_personal_prompts(root, &exclude, Some(personal)).await;
+        let mut names: Vec<(String, String)> = found
+            .into_iter()
+            .map(|e| (e.name.clone(), e.content))
+            .collect();
+        names.sort_by(|a, b| a.0.cmp(&b.0));
+        pretty_assertions::assert_eq!(
+            names,
+            vec![
+                ("shared".to_string(), "project".to_string()),
+                ("x".to_string(), "x".to_string()),
+                ("y".to_string(), "y".to_string()),
+            ]
+        );
     }
 }

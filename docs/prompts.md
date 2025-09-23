@@ -2,7 +2,9 @@
 
 Save frequently used prompts as Markdown files and reuse them quickly from the slash menu.
 
-- Location: Put files in `$CODEX_HOME/prompts/` (defaults to `~/.codex/prompts/`).
+- Locations:
+  - Project prompts: `.codex/prompts/` at your project root.
+  - Personal prompts: `$CODEX_HOME/prompts/` (defaults to `~/.codex/prompts/`).
 - File type: Only Markdown files with the `.md` extension are recognized.
 - Name: The filename without the `.md` extension becomes the slash entry. For a file named `my-prompt.md`, type `/my-prompt`.
 - Content: The file contents are sent as your message when you select the item in the slash popup and press Enter.
@@ -11,5 +13,6 @@ Save frequently used prompts as Markdown files and reuse them quickly from the s
   - In the composer, type `/` to open the slash popup and begin typing your prompt name.
   - Use Up/Down to select it. Press Enter to submit its contents, or Tab to autocomplete the name.
 - Notes:
+  - When a project prompt and a personal prompt share the same name, the project prompt takes precedence.
   - Files with names that collide with built‑in commands (e.g. `/init`) are ignored and won’t appear.
   - New or changed files are discovered on session start. If you add a new prompt while Codex is running, start a new session to pick it up.
