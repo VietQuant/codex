@@ -16,6 +16,7 @@ use ratatui::layout::Rect;
 use ratatui::widgets::WidgetRef;
 use std::time::Duration;
 
+mod agent_popup;
 mod approval_modal_view;
 mod bottom_pane_view;
 mod chat_composer;
@@ -23,7 +24,6 @@ mod chat_composer_history;
 mod command_popup;
 pub mod custom_prompt_view;
 mod file_search_popup;
-mod agent_popup;
 mod list_selection_view;
 pub(crate) use list_selection_view::SelectionViewParams;
 mod paste_burst;

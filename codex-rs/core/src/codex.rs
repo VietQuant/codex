@@ -2983,9 +2983,7 @@ fn create_agent_error_response(call_id: String, error_msg: &str) -> (String, Res
 }
 
 /// Get the agent registry from the session
-async fn get_agent_registry(
-    sess: &Session,
-) -> Result<Arc<crate::agent::AgentRegistry>, String> {
+async fn get_agent_registry(sess: &Session) -> Result<Arc<crate::agent::AgentRegistry>, String> {
     let agent_registry_guard = sess.agent_registry.lock().await;
     match agent_registry_guard.as_ref() {
         Some(r) => Ok(r.clone()),

@@ -77,7 +77,8 @@ impl AgentPopup {
         rows.sort_by(|a, b| a.name.cmp(&b.name));
         self.rows = rows;
         self.state.clamp_selection(self.rows.len());
-        self.state.ensure_visible(self.rows.len(), self.rows.len().min(MAX_POPUP_ROWS));
+        self.state
+            .ensure_visible(self.rows.len(), self.rows.len().min(MAX_POPUP_ROWS));
     }
 
     pub(crate) fn move_up(&mut self) {
@@ -133,7 +134,11 @@ impl WidgetRef for AgentPopup {
             &self.state,
             MAX_POPUP_ROWS,
             false,
-            if self.query.is_empty() { "type an agent name" } else { "no agents" },
+            if self.query.is_empty() {
+                "type an agent name"
+            } else {
+                "no agents"
+            },
         );
     }
 }

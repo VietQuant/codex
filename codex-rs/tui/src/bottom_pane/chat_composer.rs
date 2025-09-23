@@ -21,11 +21,11 @@ use ratatui::widgets::Borders;
 use ratatui::widgets::StatefulWidgetRef;
 use ratatui::widgets::WidgetRef;
 
+use super::agent_popup::AgentPopup;
 use super::chat_composer_history::ChatComposerHistory;
 use super::command_popup::CommandItem;
 use super::command_popup::CommandPopup;
 use super::file_search_popup::FileSearchPopup;
-use super::agent_popup::AgentPopup;
 use super::paste_burst::CharDecision;
 use super::paste_burst::PasteBurst;
 use crate::bottom_pane::paste_burst::FlushResult;
@@ -40,8 +40,8 @@ use crate::clipboard_paste::normalize_pasted_path;
 use crate::clipboard_paste::pasted_image_format;
 use crate::key_hint;
 use crate::ui_consts::LIVE_PREFIX_COLS;
-use codex_file_search::FileMatch;
 use codex_core::protocol::Op;
+use codex_file_search::FileMatch;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
@@ -159,7 +159,9 @@ impl ChatComposer {
                 Constraint::Max(popup.calculate_required_height(area.width))
             }
             ActivePopup::File(popup) => Constraint::Max(popup.calculate_required_height()),
-            ActivePopup::Agent(popup) => Constraint::Max(popup.calculate_required_height(area.width)),
+            ActivePopup::Agent(popup) => {
+                Constraint::Max(popup.calculate_required_height(area.width))
+            }
             ActivePopup::None => Constraint::Max(FOOTER_HEIGHT_WITH_HINT),
         };
         let [textarea_rect, _] =
@@ -602,22 +604,35 @@ impl ChatComposer {
             unreachable!();
         };
         match key_event {
-            KeyEvent { code: KeyCode::Up, .. } => {
+            KeyEvent {
+                code: KeyCode::Up, ..
+            } => {
                 popup.move_up();
                 (InputResult::None, true)
             }
-            KeyEvent { code: KeyCode::Down, .. } => {
+            KeyEvent {
+                code: KeyCode::Down,
+                ..
+            } => {
                 popup.move_down();
                 (InputResult::None, true)
             }
-            KeyEvent { code: KeyCode::Esc, .. } => {
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } => {
                 if let Some(token) = Self::current_at_token(&self.textarea) {
                     self.dismissed_file_popup_token = Some(token);
                 }
                 self.active_popup = ActivePopup::None;
                 (InputResult::None, true)
             }
-            KeyEvent { code: KeyCode::Tab, .. } | KeyEvent { code: KeyCode::Enter, .. } => {
+            KeyEvent {
+                code: KeyCode::Tab, ..
+            }
+            | KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            } => {
                 let selected = popup.selected_agent().map(|s| s.to_string());
                 self.active_popup = ActivePopup::None;
                 if let Some(name) = selected {

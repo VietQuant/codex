@@ -103,9 +103,9 @@ use codex_core::protocol::AskForApproval;
 use codex_core::protocol::SandboxPolicy;
 use codex_core::protocol_config_types::ReasoningEffort as ReasoningEffortConfig;
 use codex_file_search::FileMatch;
-use std::path::Path;
 use once_cell::sync::Lazy;
 use regex_lite::Regex;
+use std::path::Path;
 
 // Track information about an in-flight exec command.
 struct RunningCommand {
@@ -1829,10 +1829,14 @@ impl ChatWidget {
 
         static RE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
             vec![
-                Regex::new(r"(?i)\b(?:use|have|invoke|call)\s+the\s+([a-z0-9_-]+)\s+agent\s+to\s+(.+)").unwrap(),
+                Regex::new(
+                    r"(?i)\b(?:use|have|invoke|call)\s+the\s+([a-z0-9_-]+)\s+agent\s+to\s+(.+)",
+                )
+                .unwrap(),
                 Regex::new(r"(?i)\b([a-z0-9_-]+)\s+agent:\s+(.+)").unwrap(),
                 Regex::new(r"(?i)\bagent\s+([a-z0-9_-]+):\s+(.+)").unwrap(),
-                Regex::new(r"(?i)\b(?:use|have|invoke|call)\s+([a-z0-9_-]+)\s+agent\s+to\s+(.+)").unwrap(),
+                Regex::new(r"(?i)\b(?:use|have|invoke|call)\s+([a-z0-9_-]+)\s+agent\s+to\s+(.+)")
+                    .unwrap(),
             ]
         });
 
