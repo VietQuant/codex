@@ -92,6 +92,8 @@ use codex_core::protocol::SandboxPolicy;
 use codex_core::protocol_config_types::ReasoningEffort as ReasoningEffortConfig;
 use codex_file_search::FileMatch;
 use codex_protocol::mcp_protocol::ConversationId;
+use once_cell::sync::Lazy;
+use regex_lite::Regex;
 
 // Track information about an in-flight exec command.
 struct RunningCommand {
@@ -187,6 +189,7 @@ impl ChatWidget {
             self.replay_initial_messages(messages);
         }
         // Ask codex-core to enumerate custom prompts for this session.
+        // Agents will be listed only when the user explicitly requests them (e.g., /agents).
         self.submit_op(Op::ListCustomPrompts);
         if let Some(user_message) = self.initial_user_message.take() {
             self.submit_user_message(user_message);
@@ -1121,6 +1124,8 @@ impl ChatWidget {
             EventMsg::McpListToolsResponse(ev) => self.on_list_mcp_tools(ev),
             EventMsg::ListCustomPromptsResponse(ev) => self.on_list_custom_prompts(ev),
             EventMsg::ListAgentsResponse(ev) => {
+                // Cache agents for @agent typeahead and add a transcript cell.
+                self.bottom_pane.set_agents(ev.agents.clone());
                 self.add_to_history(history_cell::new_agents_list(ev.agents));
             }
             EventMsg::AgentBegin(ev) => {
@@ -1456,6 +1461,13 @@ impl ChatWidget {
             return;
         }
 
+        // Safe intent detection: infer agent call from plain language when unambiguous.
+        if !text.contains('@') && text.to_lowercase().contains("agent") {
+            if let Some(converted) = self.try_infer_agent_intent(&text) {
+                text = converted;
+            }
+        }
+
         // Parse and convert @agent mentions
         if text.contains('@') {
             use crate::agent_mention::parse_agent_mentions;
@@ -1475,6 +1487,39 @@ impl ChatWidget {
         }
 
         self.submit_user_message(text.into());
+    }
+
+    fn try_infer_agent_intent(&mut self, input: &str) -> Option<String> {
+        // Ensure we have agent names; if not, request and skip for now.
+        let known = self.bottom_pane.agent_names();
+        if known.is_empty() {
+            self.submit_op(Op::ListAgents);
+            return None;
+        }
+        let mut canon = std::collections::HashMap::new();
+        for n in &known {
+            canon.insert(n.to_lowercase(), n.clone());
+        }
+
+        static RE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+            vec![
+                Regex::new(r"(?i)\b(?:use|have|invoke|call)\s+the\s+([a-z0-9_-]+)\s+agent\s+to\s+(.+)").unwrap(),
+                Regex::new(r"(?i)\b([a-z0-9_-]+)\s+agent:\s+(.+)").unwrap(),
+                Regex::new(r"(?i)\bagent\s+([a-z0-9_-]+):\s+(.+)").unwrap(),
+                Regex::new(r"(?i)\b(?:use|have|invoke|call)\s+([a-z0-9_-]+)\s+agent\s+to\s+(.+)").unwrap(),
+            ]
+        });
+
+        for re in RE_PATTERNS.iter() {
+            if let Some(caps) = re.captures(input) {
+                let name_raw = caps.get(1)?.as_str().to_lowercase();
+                let task = caps.get(2)?.as_str().trim();
+                if let Some(canonical) = canon.get(&name_raw) {
+                    return Some(format!("@agent-{}: {}", canonical, task));
+                }
+            }
+        }
+        None
     }
 
     pub(crate) fn token_usage(&self) -> TokenUsage {

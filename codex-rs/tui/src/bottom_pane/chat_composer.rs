@@ -25,6 +25,7 @@ use super::chat_composer_history::ChatComposerHistory;
 use super::command_popup::CommandItem;
 use super::command_popup::CommandPopup;
 use super::file_search_popup::FileSearchPopup;
+use super::agent_popup::AgentPopup;
 use super::paste_burst::CharDecision;
 use super::paste_burst::PasteBurst;
 use crate::bottom_pane::paste_burst::FlushResult;
@@ -40,6 +41,7 @@ use crate::clipboard_paste::pasted_image_format;
 use crate::key_hint;
 use crate::ui_consts::LIVE_PREFIX_COLS;
 use codex_file_search::FileMatch;
+use codex_core::protocol::Op;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
@@ -87,6 +89,7 @@ pub(crate) struct ChatComposer {
     // When true, disables paste-burst logic and inserts characters immediately.
     disable_paste_burst: bool,
     custom_prompts: Vec<CustomPrompt>,
+    agents: Vec<codex_core::protocol::AgentInfo>,
 }
 
 /// Popup state – at most one can be visible at any time.
@@ -94,6 +97,7 @@ enum ActivePopup {
     None,
     Command(CommandPopup),
     File(FileSearchPopup),
+    Agent(AgentPopup),
 }
 
 const FOOTER_HINT_HEIGHT: u16 = 1;
@@ -130,6 +134,7 @@ impl ChatComposer {
             paste_burst: PasteBurst::default(),
             disable_paste_burst: false,
             custom_prompts: Vec::new(),
+            agents: Vec::new(),
         };
         // Apply configuration via the setter to keep side-effects centralized.
         this.set_disable_paste_burst(disable_paste_burst);
@@ -144,6 +149,7 @@ impl ChatComposer {
                 ActivePopup::None => FOOTER_HEIGHT_WITH_HINT,
                 ActivePopup::Command(c) => c.calculate_required_height(width),
                 ActivePopup::File(c) => c.calculate_required_height(),
+                ActivePopup::Agent(c) => c.calculate_required_height(width),
             }
     }
 
@@ -153,6 +159,7 @@ impl ChatComposer {
                 Constraint::Max(popup.calculate_required_height(area.width))
             }
             ActivePopup::File(popup) => Constraint::Max(popup.calculate_required_height()),
+            ActivePopup::Agent(popup) => Constraint::Max(popup.calculate_required_height(area.width)),
             ActivePopup::None => Constraint::Max(FOOTER_HEIGHT_WITH_HINT),
         };
         let [textarea_rect, _] =
@@ -214,12 +221,12 @@ impl ChatComposer {
         // Explicit paste events should not trigger Enter suppression.
         self.paste_burst.clear_after_explicit_paste();
         // Keep popup sync consistent with key handling: prefer slash popup; only
-        // sync file popup when slash popup is NOT active.
+        // sync @ popup when slash popup is NOT active.
         self.sync_command_popup();
         if matches!(self.active_popup, ActivePopup::Command(_)) {
             self.dismissed_file_popup_token = None;
         } else {
-            self.sync_file_search_popup();
+            self.sync_agent_or_file_popup();
         }
         true
     }
@@ -260,7 +267,7 @@ impl ChatComposer {
         self.textarea.set_text(&text);
         self.textarea.set_cursor(0);
         self.sync_command_popup();
-        self.sync_file_search_popup();
+        self.sync_agent_or_file_popup();
     }
 
     /// Get the current composer text.
@@ -313,6 +320,19 @@ impl ChatComposer {
         }
     }
 
+    pub(crate) fn set_agents(&mut self, agents: Vec<codex_core::protocol::AgentInfo>) {
+        self.agents = agents;
+        if let ActivePopup::Agent(popup) = &mut self.active_popup {
+            if let Some(current) = Self::current_at_token(&self.textarea) {
+                popup.set_query(&current, &self.agents);
+            }
+        }
+    }
+
+    pub(crate) fn agent_names(&self) -> Vec<String> {
+        self.agents.iter().map(|a| a.name.clone()).collect()
+    }
+
     pub fn set_ctrl_c_quit_hint(&mut self, show: bool, has_focus: bool) {
         self.ctrl_c_quit_hint = show;
         self.set_has_focus(has_focus);
@@ -321,7 +341,7 @@ impl ChatComposer {
     pub(crate) fn insert_str(&mut self, text: &str) {
         self.textarea.insert_str(text);
         self.sync_command_popup();
-        self.sync_file_search_popup();
+        self.sync_agent_or_file_popup();
     }
 
     /// Handle a key event coming from the main UI.
@@ -329,6 +349,7 @@ impl ChatComposer {
         let result = match &mut self.active_popup {
             ActivePopup::Command(_) => self.handle_key_event_with_slash_popup(key_event),
             ActivePopup::File(_) => self.handle_key_event_with_file_popup(key_event),
+            ActivePopup::Agent(_) => self.handle_key_event_with_agent_popup(key_event),
             ActivePopup::None => self.handle_key_event_without_popup(key_event),
         };
 
@@ -337,7 +358,7 @@ impl ChatComposer {
         if matches!(self.active_popup, ActivePopup::Command(_)) {
             self.dismissed_file_popup_token = None;
         } else {
-            self.sync_file_search_popup();
+            self.sync_agent_or_file_popup();
         }
 
         result
@@ -575,6 +596,40 @@ impl ChatComposer {
         }
     }
 
+    /// Handle key event when the agent popup is visible.
+    fn handle_key_event_with_agent_popup(&mut self, key_event: KeyEvent) -> (InputResult, bool) {
+        let ActivePopup::Agent(popup) = &mut self.active_popup else {
+            unreachable!();
+        };
+        match key_event {
+            KeyEvent { code: KeyCode::Up, .. } => {
+                popup.move_up();
+                (InputResult::None, true)
+            }
+            KeyEvent { code: KeyCode::Down, .. } => {
+                popup.move_down();
+                (InputResult::None, true)
+            }
+            KeyEvent { code: KeyCode::Esc, .. } => {
+                if let Some(token) = Self::current_at_token(&self.textarea) {
+                    self.dismissed_file_popup_token = Some(token);
+                }
+                self.active_popup = ActivePopup::None;
+                (InputResult::None, true)
+            }
+            KeyEvent { code: KeyCode::Tab, .. } | KeyEvent { code: KeyCode::Enter, .. } => {
+                let selected = popup.selected_agent().map(|s| s.to_string());
+                self.active_popup = ActivePopup::None;
+                if let Some(name) = selected {
+                    self.insert_selected_agent(&name);
+                    return (InputResult::None, true);
+                }
+                (InputResult::None, true)
+            }
+            input => self.handle_input_basic(input),
+        }
+    }
+
     fn is_image_path(path: &str) -> bool {
         let lower = path.to_ascii_lowercase();
         lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg")
@@ -723,6 +778,39 @@ impl ChatComposer {
         self.textarea.set_cursor(new_cursor);
     }
 
+    fn insert_selected_agent(&mut self, name: &str) {
+        let cursor_offset = self.textarea.cursor();
+        let text = self.textarea.text();
+        let safe_cursor = Self::clamp_to_char_boundary(text, cursor_offset);
+        let before_cursor = &text[..safe_cursor];
+        let after_cursor = &text[safe_cursor..];
+
+        // Determine token boundaries.
+        let start_idx = before_cursor
+            .char_indices()
+            .rfind(|(_, c)| c.is_whitespace())
+            .map(|(idx, c)| idx + c.len_utf8())
+            .unwrap_or(0);
+        let end_rel_idx = after_cursor
+            .char_indices()
+            .find(|(_, c)| c.is_whitespace())
+            .map(|(idx, _)| idx)
+            .unwrap_or(after_cursor.len());
+        let end_idx = safe_cursor + end_rel_idx;
+
+        // Insert with an explicit agent- prefix so the main agent clearly treats it as an agent mention.
+        let replacement = format!("@agent-{name}: ");
+        let mut new_text =
+            String::with_capacity(text.len() - (end_idx - start_idx) + replacement.len());
+        new_text.push_str(&text[..start_idx]);
+        new_text.push_str(&replacement);
+        new_text.push_str(&text[end_idx..]);
+
+        self.textarea.set_text(&new_text);
+        let new_cursor = start_idx.saturating_add(replacement.len());
+        self.textarea.set_cursor(new_cursor);
+    }
+
     /// Handle key event when no popup is visible.
     fn handle_key_event_without_popup(&mut self, key_event: KeyEvent) -> (InputResult, bool) {
         match key_event {
@@ -848,12 +936,12 @@ impl ChatComposer {
                 // pending fast char flushes as normal typed input.
                 self.textarea.insert_str(ch.to_string().as_str());
                 // Keep popup sync consistent with key handling: prefer slash popup; only
-                // sync file popup when slash popup is NOT active.
+                // sync @ popup when slash popup is NOT active.
                 self.sync_command_popup();
                 if matches!(self.active_popup, ActivePopup::Command(_)) {
                     self.dismissed_file_popup_token = None;
                 } else {
-                    self.sync_file_search_popup();
+                    self.sync_agent_or_file_popup();
                 }
                 true
             }
@@ -1172,9 +1260,9 @@ impl ChatComposer {
         }
     }
 
-    /// Synchronize `self.file_search_popup` with the current text in the textarea.
+    /// Synchronize the @ popup (agent or file search) with the current text in the textarea.
     /// Note this is only called when self.active_popup is NOT Command.
-    fn sync_file_search_popup(&mut self) {
+    fn sync_agent_or_file_popup(&mut self) {
         // Determine if there is an @token underneath the cursor.
         let query = match Self::current_at_token(&self.textarea) {
             Some(token) => token,
@@ -1190,27 +1278,47 @@ impl ChatComposer {
             return;
         }
 
-        if !query.is_empty() {
-            self.app_event_tx
-                .send(AppEvent::StartFileSearch(query.clone()));
-        }
-
-        match &mut self.active_popup {
-            ActivePopup::File(popup) => {
-                if query.is_empty() {
-                    popup.set_empty_prompt();
-                } else {
-                    popup.set_query(&query);
+        // Behavior:
+        // - Plain "@" or any non-"agent" token => file search popup
+        // - "@agent" prefix => agent suggestions popup
+        let looks_like_agent = query.to_ascii_lowercase().starts_with("agent");
+        if !looks_like_agent {
+            if !query.is_empty() {
+                self.app_event_tx
+                    .send(AppEvent::StartFileSearch(query.clone()));
+            }
+            match &mut self.active_popup {
+                ActivePopup::File(popup) => {
+                    if query.is_empty() {
+                        popup.set_empty_prompt();
+                    } else {
+                        popup.set_query(&query);
+                    }
+                }
+                _ => {
+                    let mut popup = FileSearchPopup::new();
+                    if query.is_empty() {
+                        popup.set_empty_prompt();
+                    } else {
+                        popup.set_query(&query);
+                    }
+                    self.active_popup = ActivePopup::File(popup);
                 }
             }
-            _ => {
-                let mut popup = FileSearchPopup::new();
-                if query.is_empty() {
-                    popup.set_empty_prompt();
-                } else {
-                    popup.set_query(&query);
+        } else {
+            // Ensure we have agent data; lazily request if missing.
+            if self.agents.is_empty() {
+                self.app_event_tx.send(AppEvent::CodexOp(Op::ListAgents));
+            }
+            match &mut self.active_popup {
+                ActivePopup::Agent(popup) => {
+                    popup.set_query(&query, &self.agents);
                 }
-                self.active_popup = ActivePopup::File(popup);
+                _ => {
+                    let mut popup = AgentPopup::new();
+                    popup.set_query(&query, &self.agents);
+                    self.active_popup = ActivePopup::Agent(popup);
+                }
             }
         }
 
@@ -1239,6 +1347,10 @@ impl WidgetRef for ChatComposer {
                 0,
             ),
             ActivePopup::File(popup) => (Constraint::Max(popup.calculate_required_height()), 0),
+            ActivePopup::Agent(popup) => (
+                Constraint::Max(popup.calculate_required_height(area.width)),
+                0,
+            ),
             ActivePopup::None => (
                 Constraint::Length(FOOTER_HEIGHT_WITH_HINT),
                 FOOTER_SPACING_HEIGHT,
@@ -1251,6 +1363,9 @@ impl WidgetRef for ChatComposer {
                 popup.render_ref(popup_rect, buf);
             }
             ActivePopup::File(popup) => {
+                popup.render_ref(popup_rect, buf);
+            }
+            ActivePopup::Agent(popup) => {
                 popup.render_ref(popup_rect, buf);
             }
             ActivePopup::None => {

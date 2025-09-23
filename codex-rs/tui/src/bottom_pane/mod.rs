@@ -21,6 +21,7 @@ mod chat_composer;
 mod chat_composer_history;
 mod command_popup;
 mod file_search_popup;
+mod agent_popup;
 mod list_selection_view;
 mod paste_burst;
 mod popup_consts;
@@ -349,6 +350,17 @@ impl BottomPane {
     pub(crate) fn set_custom_prompts(&mut self, prompts: Vec<CustomPrompt>) {
         self.composer.set_custom_prompts(prompts);
         self.request_redraw();
+    }
+
+    /// Update known agents for the @agent popup.
+    pub(crate) fn set_agents(&mut self, agents: Vec<codex_core::protocol::AgentInfo>) {
+        self.composer.set_agents(agents);
+        self.request_redraw();
+    }
+
+    /// List known agent names (for intent detection).
+    pub(crate) fn agent_names(&self) -> Vec<String> {
+        self.composer.agent_names()
     }
 
     pub(crate) fn composer_is_empty(&self) -> bool {

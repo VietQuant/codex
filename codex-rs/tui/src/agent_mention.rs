@@ -4,7 +4,8 @@ use regex_lite::Regex;
 // Compile regex once at startup
 #[allow(clippy::expect_used)]
 static AGENT_MENTION_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"@(\w+):?\s+([^\n@]+)")
+    // Allow hyphens in the agent token to support the "agent-<name>" prefix inserted by the UI.
+    Regex::new(r"@([\w-]+):?\s+([^\n@]+)")
         .expect("Failed to compile agent mention regex - this is a bug")
 });
 
@@ -41,11 +42,19 @@ pub fn parse_agent_mentions(text: &str) -> Vec<AgentMention> {
 
 /// Convert agent mention to tool call format
 pub fn convert_to_agent_call(mention: &AgentMention) -> String {
-    format!("Use the {} agent to {}", mention.agent_name, mention.task)
+    // Support names inserted as "agent-<name>" by the typeahead; strip the prefix for execution.
+    let name = mention
+        .agent_name
+        .strip_prefix("agent-")
+        .unwrap_or(&mention.agent_name);
+    format!("Use the {} agent to {}", name, mention.task)
 }
 
 /// Replace mentions in text with converted calls
 pub fn replace_mentions_with_calls(text: &str) -> String {
+    // Treat both forms as subagent invocations:
+    //  - @agent-<name>: task   (inserted by the popup)
+    //  - @<name>: task        (typed directly)
     let mentions = parse_agent_mentions(text);
     if mentions.is_empty() {
         return text.to_string();
