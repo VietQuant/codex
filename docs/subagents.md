@@ -68,10 +68,13 @@ Codex comes with one built-in agent:
 
 ## Custom Agent Configuration
 
-Create custom agents by adding a configuration file at `~/.codex/agents.toml`:
+Create custom agents using either a project-scoped or personal configuration (project takes precedence on name conflicts):
+
+- Project: `.codex/agents.toml` at your project root
+- Personal: `~/.codex/agents.toml`
 
 ```toml
-# ~/.codex/agents.toml
+# .codex/agents.toml (project) or ~/.codex/agents.toml (personal)
 
 [researcher]
 prompt = """
@@ -137,7 +140,7 @@ For longer prompts, you can store them in separate files:
 
 ```toml
 [complex-agent]
-prompt_file = "prompts/complex-agent.md"  # Relative to ~/.codex/
+prompt_file = "prompts/complex-agent.md"  # Relative to the corresponding .codex/ root
 ```
 
 Or use absolute paths:

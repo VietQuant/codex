@@ -92,26 +92,35 @@ impl AgentRegistry {
         };
 
         // Canonicalize to resolve ../ and symlinks
-        let canonical = path
-            .canonicalize()
-            .map_err(|e| anyhow::anyhow!("Cannot access prompt file: {}", e))?;
+        let canonical = match path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "Security error: Prompt file must be within project .codex or ~/.codex directory"
+                ));
+            }
+        };
 
-        // Get the home/.codex directory
+        // Get the home/.codex directory (personal root)
         let home_codex = dirs::home_dir()
             .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
             .join(".codex");
 
-        // Security check: path must be within ~/.codex or the base directory
-        if !canonical.starts_with(&home_codex) && !canonical.starts_with(base_dir) {
+        // Security check: path must be within the provided base directory (or its children)
+        // or within the personal ~/.codex directory
+        let base_canonical = base_dir
+            .canonicalize()
+            .unwrap_or_else(|_| base_dir.to_path_buf());
+        if !canonical.starts_with(&base_canonical) && !canonical.starts_with(&home_codex) {
             return Err(anyhow::anyhow!(
-                "Security error: Prompt file must be within ~/.codex directory"
+                "Security error: Prompt file must be within project .codex or ~/.codex directory"
             ));
         }
 
         Ok(canonical)
     }
 
-    /// Create a new agent registry, loading user configurations if available
+    /// Create a new agent registry, loading project-level then user-level configurations if available
     pub fn new() -> Result<Self> {
         let mut agents = HashMap::new();
 
@@ -126,84 +135,66 @@ impl AgentRegistry {
             }
         );
 
-        // Try to load user agents from ~/.codex/agents.toml
-        let agents_dir = Self::get_agents_directory();
-        if let Some(ref dir) = agents_dir {
-            let config_path = dir.join("agents.toml");
-            if config_path.exists() {
-                match std::fs::read_to_string(&config_path) {
-                    Ok(content) => {
-                        match toml::from_str::<HashMap<String, AgentConfig>>(&content) {
-                            Ok(user_agents) => {
-                                // Process each agent config
-                                for (name, mut config) in user_agents {
-                                    // Validate the configuration
-                                    if let Err(e) = config.validate() {
-                                        tracing::error!(
-                                            "Agent '{}' configuration invalid: {}",
-                                            name,
-                                            e
-                                        );
-                                        continue;
-                                    }
+        // Load project-level then user-level agents, with project taking precedence
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let project_root = cwd.join(".codex");
+        let home_root = Self::get_agents_directory();
 
-                                    // If prompt_file is specified, load the prompt from file
-                                    if let Some(ref prompt_file) = config.prompt_file {
-                                        // Validate the path to prevent traversal attacks
-                                        match Self::validate_prompt_path(dir, prompt_file) {
-                                            Ok(safe_path) => {
-                                                match std::fs::read_to_string(&safe_path) {
-                                                    Ok(prompt_content) => {
-                                                        config.prompt = Some(prompt_content);
-                                                        tracing::debug!(
-                                                            "Loaded prompt file for agent '{}'",
-                                                            name
-                                                        );
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::error!(
-                                                            "Cannot read prompt file '{}' for agent '{}': {}",
-                                                            prompt_file,
-                                                            name,
-                                                            e
-                                                        );
-                                                        // Skip this agent but continue loading others
-                                                        continue;
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                tracing::error!(
-                                                    "Agent '{}' configuration error: {}",
-                                                    name,
-                                                    e
-                                                );
-                                                // Skip this agent but continue loading others
-                                                continue;
-                                            }
-                                        }
-                                    }
-
-                                    agents.insert(name, config);
-                                }
-                                tracing::info!("Loaded {} user-defined agents", agents.len() - 1);
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to parse agents.toml: {}", e);
-                            }
+        fn load_agents_from(root: &Path) -> HashMap<String, AgentConfig> {
+            let mut out = HashMap::new();
+            let path = root.join("agents.toml");
+            if !path.exists() {
+                return out;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                return out;
+            };
+            let Ok(mut parsed) = toml::from_str::<HashMap<String, AgentConfig>>(&content) else {
+                return out;
+            };
+            for (name, mut config) in parsed.clone() {
+                if let Err(e) = config.validate() {
+                    tracing::warn!("Invalid agent config for '{}': {}", name, e);
+                    parsed.remove(&name);
+                    continue;
+                }
+                if let Some(prompt_file) = &config.prompt_file {
+                    if let Ok(safe_path) = AgentRegistry::validate_prompt_path(root, prompt_file) {
+                        if let Ok(prompt) = std::fs::read_to_string(&safe_path) {
+                            config.prompt = Some(prompt);
+                            parsed.insert(name.clone(), config);
                         }
-                    }
-                    Err(e) => {
-                        tracing::debug!("Could not read agents.toml: {}", e);
                     }
                 }
             }
+            for (k, v) in parsed {
+                out.insert(k, v);
+            }
+            out
+        }
+
+        let mut merged: HashMap<String, AgentConfig> = HashMap::new();
+        for (k, v) in load_agents_from(&project_root) {
+            merged.insert(k, v);
+        }
+        if let Some(ref home) = home_root {
+            for (k, v) in load_agents_from(home) {
+                merged.entry(k).or_insert(v);
+            }
+        }
+        let agents_dir = if project_root.exists() {
+            Some(project_root)
+        } else {
+            home_root
+        };
+        for (name, cfg) in merged {
+            agents.insert(name, cfg);
         }
 
         Ok(Self { agents, agents_dir })
     }
 
-    /// Get the agents directory path (~/.codex/agents)
+    /// Get the agents directory path (~/.codex)
     fn get_agents_directory() -> Option<PathBuf> {
         std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
