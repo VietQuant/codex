@@ -511,6 +511,9 @@ impl ChatWidget {
 
     fn on_background_event(&mut self, message: String) {
         debug!("BackgroundEvent: {message}");
+        // Display background events (including subagent status) to users
+        self.add_to_history(history_cell::new_info_event(message, None));
+        self.request_redraw();
     }
 
     fn on_stream_error(&mut self, message: String) {

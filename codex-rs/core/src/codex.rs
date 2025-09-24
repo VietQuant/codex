@@ -124,7 +124,7 @@ use crate::shell;
 struct PendingToolCall {
     item: ResponseItem,
     call_id: String,
-    name: String,
+    _name: String,
     arguments: Option<String>,
 }
 
@@ -2306,7 +2306,7 @@ async fn try_run_turn(
                 pending_agent_calls.push(PendingToolCall {
                     item: item.clone(),
                     call_id: call_id.clone(),
-                    name: name.clone(),
+                    _name: name.clone(),
                     arguments: Some(arguments.clone()),
                 });
             }
@@ -2329,7 +2329,7 @@ async fn try_run_turn(
                 });
             }
             ResponseItem::LocalShellCall {
-                call_id: Some(id), ..
+                call_id: Some(_id), ..
             } => {
                 // Process shell calls immediately in order
                 let response = handle_response_item(
@@ -2353,7 +2353,7 @@ async fn try_run_turn(
                 pending_agent_calls.push(PendingToolCall {
                     item: item.clone(),
                     call_id: call_id.clone(),
-                    name: name.clone(),
+                    _name: name.clone(),
                     arguments: None,
                 });
             }
@@ -2955,6 +2955,7 @@ fn generate_agent_plan_id(agent_name: &str, call_id: &str) -> String {
 }
 
 /// Create an error response for agent calls
+#[allow(dead_code)]
 fn create_tool_error_response(item: &ResponseItem, error_msg: &str) -> Option<ResponseInputItem> {
     match item {
         ResponseItem::FunctionCall { call_id, .. } => Some(ResponseInputItem::FunctionCallOutput {
@@ -3052,10 +3053,10 @@ async fn execute_agents_concurrent_safe(
 
                 let plan_item_id = generate_agent_plan_id(&agent_name, &call_id);
 
-                // Execute the agent with concurrent support
-                let (result, diff_tracker) = execute_agent_isolated_concurrent(
-                    sess_wrapper_clone,
-                    context_wrapper_clone,
+                // Execute the agent with non-streaming approach
+                let (result, diff_tracker) = execute_agent_non_streaming(
+                    sess_wrapper_clone.get(),
+                    context_wrapper_clone.get(),
                     AgentExecutionParams {
                         sub_id: sub_id.clone(),
                         agent_name: agent_name.clone(),
@@ -3113,24 +3114,22 @@ struct AgentExecutionParams {
     _plan_item_id: Option<String>,
 }
 
-/// Execute an agent in an isolated context with concurrent support
-async fn execute_agent_isolated_concurrent(
-    sess_wrapper: Arc<SessionWrapper>,
-    context_wrapper: Arc<TurnContextWrapper>,
+/// Execute an agent in non-streaming mode to prevent streaming contamination
+async fn execute_agent_non_streaming(
+    sess: &Session,
+    parent_context: &TurnContext,
     params: AgentExecutionParams,
 ) -> (Result<String, String>, TurnDiffTracker) {
-    let sess = sess_wrapper.get();
-    let parent_context = context_wrapper.get();
     use std::time::Instant;
     let start_time = Instant::now();
 
     info!(
-        "Executing agent '{}' with isolated context (parallel)",
+        "Executing agent '{}' with non-streaming mode (parallel)",
         params.agent_name
     );
     // Log agent start and notify UI
     info!(
-        "Agent '{}' starting task (call_id: {}) - PARALLEL EXECUTION",
+        "Agent '{}' starting task (call_id: {}) - NO-STREAMING EXECUTION",
         params.agent_name, params.call_id
     );
 
@@ -3145,15 +3144,6 @@ async fn execute_agent_isolated_concurrent(
         }),
     })
     .await;
-
-    // Create agent messages - just the task as a user message
-    let agent_messages = vec![ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![ContentItem::InputText {
-            text: params.task_message.clone(),
-        }],
-    }];
 
     // Build agent's custom instructions: agent system prompt + AGENTS.md
     let mut agent_custom_instructions = String::new();
@@ -3193,10 +3183,19 @@ async fn execute_agent_isolated_concurrent(
         sandbox_policy: parent_context.sandbox_policy.clone(),
         shell_environment_policy: parent_context.shell_environment_policy.clone(),
         cwd: parent_context.cwd.clone(),
-        is_review_mode: false,
+        is_review_mode: true, // Use review mode to suppress streaming
     };
 
-    // Execute a single turn for the agent
+    // Create agent messages
+    let agent_messages = vec![ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: params.task_message.clone(),
+        }],
+    }];
+
+    // Execute agent without streaming (using review mode suppression)
     let mut agent_response = String::new();
     let mut turn_diff_tracker = TurnDiffTracker::new();
 
@@ -3229,38 +3228,29 @@ async fn execute_agent_isolated_concurrent(
         }
         Err(e) => {
             error!("Agent '{}' turn failed: {e:#}", params.agent_name);
-            agent_response = format!("Error during agent execution: {e}");
-            return (Err(agent_response.clone()), turn_diff_tracker);
+            return (Err(format!("Error during agent execution: {e}")), turn_diff_tracker);
         }
     }
 
     let duration = start_time.elapsed();
-
-    // Log agent completion for PARALLEL EXECUTION
     info!(
-        "Agent '{}' completed in {}ms (call_id: {}) - PARALLEL EXECUTION",
+        "Agent '{}' completed in {}ms (call_id: {}) - NO STREAMING",
         params.agent_name,
         duration.as_millis(),
         params.call_id
     );
 
-    // Send agent completion status to UI
+    // Send completion status message
     let status_msg = if agent_response.is_empty() {
         format!(
             "❌ Agent '{}' failed: No response generated",
             params.agent_name
         )
     } else {
-        let preview = if agent_response.len() > 100 {
-            format!("{}...", &agent_response[..100])
-        } else {
-            agent_response.clone()
-        };
         format!(
-            "✅ Agent '{}' completed in {:.2}s: {}",
+            "✅ Agent '{}' completed in {:.2}s.",
             params.agent_name,
-            duration.as_secs_f64(),
-            preview.trim().replace('\n', " ")
+            duration.as_secs_f64()
         )
     };
 
@@ -3274,6 +3264,7 @@ async fn execute_agent_isolated_concurrent(
 
     (Ok(agent_response), turn_diff_tracker)
 }
+
 
 /// Generate a comprehensive summary of agent execution
 #[allow(dead_code)]
