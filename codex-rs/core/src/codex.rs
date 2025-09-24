@@ -3183,53 +3183,146 @@ async fn execute_agent_non_streaming(
         sandbox_policy: parent_context.sandbox_policy.clone(),
         shell_environment_policy: parent_context.shell_environment_policy.clone(),
         cwd: parent_context.cwd.clone(),
-        is_review_mode: true, // Use review mode to suppress streaming
+        is_review_mode: true,
     };
 
-    // Create agent messages
+    let task_message = if params.agent_system_prompt.trim().is_empty() {
+        params.task_message.clone()
+    } else {
+        format!(
+            "Agent context: {}\n\n{}",
+            params.agent_system_prompt.trim(),
+            params.task_message
+        )
+    };
+
     let agent_messages = vec![ResponseItem::Message {
         id: None,
         role: "user".to_string(),
-        content: vec![ContentItem::InputText {
-            text: params.task_message.clone(),
-        }],
+        content: vec![ContentItem::InputText { text: task_message }],
     }];
 
     // Execute agent without streaming (using review mode suppression)
-    let mut agent_response = String::new();
+    let mut review_history = sess.build_initial_context(&agent_turn_context);
+    review_history.extend(agent_messages.clone());
+
+    let mut assistant_chunks: Vec<String> = Vec::new();
+    let mut fallback_response: Option<String> = None;
     let mut turn_diff_tracker = TurnDiffTracker::new();
 
-    match run_turn(
-        sess,
-        &agent_turn_context,
-        &mut turn_diff_tracker,
-        params.sub_id.clone(),
-        agent_messages,
-    )
-    .await
-    {
-        Ok(turn_output) => {
-            // Extract the assistant's response
-            for processed_item in turn_output.processed_items {
-                if let ProcessedResponseItem {
-                    item: ResponseItem::Message { role, content, .. },
-                    response: None,
-                } = processed_item
-                    && role == "assistant"
-                {
-                    for content_item in content {
-                        if let ContentItem::OutputText { text } = content_item {
-                            agent_response.push_str(&text);
-                            agent_response.push('\n');
-                        }
-                    }
+    fn collect_output_text(items: &[ContentItem]) -> Option<String> {
+        let mut combined = String::new();
+        for item in items {
+            if let ContentItem::OutputText { text } = item {
+                if !combined.is_empty() {
+                    combined.push('\n');
                 }
+                combined.push_str(text);
             }
         }
-        Err(e) => {
-            error!("Agent '{}' turn failed: {e:#}", params.agent_name);
-            return (Err(format!("Error during agent execution: {e}")), turn_diff_tracker);
+        if combined.trim().is_empty() {
+            None
+        } else {
+            Some(combined)
         }
+    }
+
+    fn collect_response_text(response: &ResponseInputItem) -> Option<String> {
+        match response {
+            ResponseInputItem::FunctionCallOutput { output, .. } => {
+                if output.content.trim().is_empty() {
+                    None
+                } else {
+                    Some(output.content.clone())
+                }
+            }
+            ResponseInputItem::CustomToolCallOutput { output, .. } => {
+                if output.trim().is_empty() {
+                    None
+                } else {
+                    Some(output.clone())
+                }
+            }
+            ResponseInputItem::McpToolCallOutput { result, .. } => Some(match result {
+                Ok(call_tool_result) => serde_json::to_string(call_tool_result)
+                    .unwrap_or_else(|_| "unserializable MCP result".to_string()),
+                Err(err) => err.clone(),
+            }),
+            ResponseInputItem::Message { content, .. } => collect_output_text(content),
+        }
+    }
+
+    loop {
+        let turn_input = review_history.clone();
+        let run_result = run_turn(
+            sess,
+            &agent_turn_context,
+            &mut turn_diff_tracker,
+            params.sub_id.clone(),
+            turn_input,
+        )
+        .await;
+
+        match run_result {
+            Ok(turn_output) => {
+                let mut responses_pending = false;
+
+                for processed_item in turn_output.processed_items {
+                    let ProcessedResponseItem { item, response } = processed_item;
+
+                    if let ResponseItem::Message { role, content, .. } = &item {
+                        if let Some(text) = collect_output_text(content) {
+                            fallback_response = Some(text.clone());
+                            if response.is_none() && role == "assistant" {
+                                assistant_chunks.push(text);
+                            }
+                        }
+                    }
+
+                    review_history.push(item.clone());
+
+                    if let Some(response) = response {
+                        responses_pending = true;
+                        if let Some(text) = collect_response_text(&response) {
+                            fallback_response = Some(text.clone());
+                        }
+                        let response_item: ResponseItem = response.clone().into();
+                        review_history.push(response_item);
+                    }
+                }
+
+                if !assistant_chunks.is_empty() {
+                    break;
+                }
+
+                if !responses_pending {
+                    break;
+                }
+
+                continue;
+            }
+            Err(e) => {
+                error!("Agent '{}' turn failed: {e:#}", params.agent_name);
+                sess.notify_stream_error(
+                    &params.sub_id.clone(),
+                    format!("Error during agent execution: {e}"),
+                )
+                .await;
+                return (
+                    Err(format!("Error during agent execution: {e}")),
+                    turn_diff_tracker,
+                );
+            }
+        }
+    }
+
+    let mut agent_response = if assistant_chunks.is_empty() {
+        fallback_response.unwrap_or_default()
+    } else {
+        assistant_chunks.join("\n\n")
+    };
+    if !agent_response.is_empty() && !agent_response.ends_with('\n') {
+        agent_response.push('\n');
     }
 
     let duration = start_time.elapsed();
@@ -3247,10 +3340,16 @@ async fn execute_agent_non_streaming(
             params.agent_name
         )
     } else {
+        let preview = if agent_response.len() > 100 {
+            format!("{}...", &agent_response[..100])
+        } else {
+            agent_response.clone()
+        };
         format!(
-            "✅ Agent '{}' completed in {:.2}s.",
+            "✅ Agent '{}' completed in {:.2}s: {}",
             params.agent_name,
-            duration.as_secs_f64()
+            duration.as_secs_f64(),
+            preview.trim().replace('\n', " ")
         )
     };
 
@@ -3264,7 +3363,6 @@ async fn execute_agent_non_streaming(
 
     (Ok(agent_response), turn_diff_tracker)
 }
-
 
 /// Generate a comprehensive summary of agent execution
 #[allow(dead_code)]
