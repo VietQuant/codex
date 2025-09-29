@@ -297,6 +297,7 @@ pub(crate) struct Session {
     /// Agent registry for multi-agent orchestration
     agent_registry: Mutex<Option<Arc<crate::agent::AgentRegistry>>>,
 
+    /// Wrapper around the optional external notifier command (invoked via exec()).
     notifier: UserNotifier,
 
     /// Optional rollout recorder for persisting the conversation transcript so

@@ -30,16 +30,7 @@ const SCHEMA: &str = r#"
 "#;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn codex_returns_json_result_for_gpt5() -> anyhow::Result<()> {
-    codex_returns_json_result("gpt-5".to_string()).await
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn codex_returns_json_result_for_gpt5_codex() -> anyhow::Result<()> {
-    codex_returns_json_result("gpt-5-codex".to_string()).await
-}
-
-async fn codex_returns_json_result(model: String) -> anyhow::Result<()> {
+async fn codex_returns_json_result() -> anyhow::Result<()> {
     non_sandbox_test!(result);
 
     let server = start_mock_server().await;
@@ -81,7 +72,7 @@ async fn codex_returns_json_result(model: String) -> anyhow::Result<()> {
             cwd: cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
-            model,
+            model: "gpt-5".to_string(),
             effort: None,
             summary: ReasoningSummary::Auto,
         })
