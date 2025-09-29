@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::LazyLock;
 
 use codex_core::config::Config;
 use codex_core::config_types::Notifications;
@@ -106,13 +107,12 @@ use codex_core::protocol::AskForApproval;
 use codex_core::protocol::SandboxPolicy;
 use codex_core::protocol_config_types::ReasoningEffort as ReasoningEffortConfig;
 use codex_file_search::FileMatch;
-use once_cell::sync::Lazy;
-use regex_lite::Regex;
 use codex_git_tooling::CreateGhostCommitOptions;
 use codex_git_tooling::GhostCommit;
 use codex_git_tooling::GitToolingError;
 use codex_git_tooling::create_ghost_commit;
 use codex_git_tooling::restore_ghost_commit;
+use regex_lite::Regex;
 
 const MAX_TRACKED_GHOST_COMMITS: usize = 20;
 
@@ -1962,7 +1962,7 @@ impl ChatWidget {
             canon.insert(n.to_lowercase(), n.clone());
         }
 
-        static RE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+        static RE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
             vec![
                 Regex::new(
                     r"(?i)\b(?:use|have|invoke|call)\s+the\s+([a-z0-9_-]+)\s+agent\s+to\s+(.+)",

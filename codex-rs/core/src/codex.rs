@@ -2784,13 +2784,7 @@ async fn handle_function_call(
         "agent" => {
             // Agent calls are now handled in parallel at the turn level
             // Return a placeholder response that will be replaced by parallel execution
-            ResponseInputItem::FunctionCallOutput {
-                call_id,
-                output: FunctionCallOutputPayload {
-                    content: "Agent execution deferred for parallel processing".to_string(),
-                    success: Some(false),
-                },
-            }
+            Ok("Agent execution deferred for parallel processing".to_string())
         }
         _ => Err(FunctionCallError::RespondToModel(format!(
             "unsupported call: {name}"
@@ -3131,6 +3125,7 @@ async fn execute_agent_non_streaming(
         shell_environment_policy: parent_context.shell_environment_policy.clone(),
         cwd: parent_context.cwd.clone(),
         is_review_mode: true,
+        final_output_json_schema: parent_context.final_output_json_schema.clone(),
     };
 
     let task_message = if params.agent_system_prompt.trim().is_empty() {

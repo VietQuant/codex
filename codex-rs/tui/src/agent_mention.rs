@@ -1,9 +1,9 @@
-use once_cell::sync::Lazy;
 use regex_lite::Regex;
+use std::sync::LazyLock;
 
 // Compile regex once at startup
 #[allow(clippy::expect_used)]
-static AGENT_MENTION_RE: Lazy<Regex> = Lazy::new(|| {
+static AGENT_MENTION_RE: LazyLock<Regex> = LazyLock::new(|| {
     // Allow hyphens in the agent token to support the "agent-<name>" prefix inserted by the UI.
     Regex::new(r"@([\w-]+):?\s+([^\n@]+)")
         .expect("Failed to compile agent mention regex - this is a bug")
