@@ -61,6 +61,12 @@ pub enum InputResult {
     None,
 }
 
+#[derive(Debug, Default, Clone)]
+struct PromptArguments {
+    all: String,
+    positional: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct AttachedImage {
     placeholder: String,
@@ -438,13 +444,27 @@ impl ChatComposer {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => {
+                let command_line = self
+                    .textarea
+                    .text()
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
                 if let Some(sel) = popup.selected_item() {
+                    let (prompt_name, prompt_content) = match sel {
+                        CommandItem::UserPrompt(idx) => (
+                            popup.prompt_name(idx).map(str::to_string),
+                            popup.prompt_content(idx).map(str::to_string),
+                        ),
+                        _ => (None, None),
+                    };
                     // Clear textarea so no residual text remains.
                     self.textarea.set_text("");
                     // Capture any needed data from popup before clearing it.
                     let prompt_content = match sel {
                         CommandItem::UserPrompt(idx) => {
-                            popup.prompt_content(idx).map(str::to_string)
+                            prompt_content.or_else(|| popup.prompt_content(idx).map(str::to_string))
                         }
                         _ => None,
                     };
@@ -457,7 +477,12 @@ impl ChatComposer {
                         }
                         CommandItem::UserPrompt(_) => {
                             if let Some(contents) = prompt_content {
-                                return (InputResult::Submitted(contents), true);
+                                let args = PromptArguments::from_command_line(
+                                    &command_line,
+                                    prompt_name.as_deref(),
+                                );
+                                let filled = apply_prompt_arguments(&contents, &args);
+                                return (InputResult::Submitted(filled), true);
                             }
                             return (InputResult::None, true);
                         }
@@ -1354,6 +1379,143 @@ impl ChatComposer {
     }
 }
 
+impl PromptArguments {
+    fn from_command_line(line: &str, prompt_name: Option<&str>) -> Self {
+        if line.is_empty() {
+            return Self::default();
+        }
+
+        let trimmed = line.trim();
+        let without_slash = trimmed.strip_prefix('/').unwrap_or(trimmed);
+        let after_slash = without_slash.trim_start();
+
+        let mut first_space_idx = None;
+        for (idx, ch) in after_slash.char_indices() {
+            if ch.is_whitespace() {
+                first_space_idx = Some(idx);
+                break;
+            }
+        }
+
+        let (_typed_command, remainder) = match first_space_idx {
+            Some(idx) => (&after_slash[..idx], &after_slash[idx..]),
+            None => (after_slash, ""),
+        };
+
+        let args_slice = if let Some(name) = prompt_name {
+            if let Some(rest) = after_slash.strip_prefix(name) {
+                rest
+            } else {
+                remainder
+            }
+        } else {
+            remainder
+        };
+
+        let args_trimmed_start = args_slice.trim_start();
+        let all_args = args_trimmed_start.trim_end().to_string();
+        if all_args.is_empty() {
+            return Self::default();
+        }
+
+        let positional = split_prompt_arguments(args_trimmed_start);
+        Self {
+            all: all_args,
+            positional,
+        }
+    }
+}
+
+fn split_prompt_arguments(input: &str) -> Vec<String> {
+    let mut result: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut chars = input.chars().peekable();
+    let mut in_quote: Option<char> = None;
+
+    while let Some(ch) = chars.next() {
+        if let Some(quote) = in_quote {
+            if ch == quote {
+                in_quote = None;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+
+        match ch {
+            '"' | '\'' => {
+                in_quote = Some(ch);
+            }
+            c if c.is_whitespace() => {
+                if !current.is_empty() {
+                    result.push(current.clone());
+                    current.clear();
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if !current.is_empty() {
+        result.push(current);
+    }
+
+    result
+}
+
+fn apply_prompt_arguments(template: &str, args: &PromptArguments) -> String {
+    const ARGUMENTS_TOKEN: &str = "ARGUMENTS";
+    let mut output = String::with_capacity(template.len() + args.all.len());
+    let bytes = template.as_bytes();
+    let mut idx = 0;
+
+    while idx < bytes.len() {
+        if bytes[idx] == b'$' {
+            let mut handled = false;
+            if idx + 1 + ARGUMENTS_TOKEN.len() <= bytes.len()
+                && &template[idx + 1..idx + 1 + ARGUMENTS_TOKEN.len()] == ARGUMENTS_TOKEN
+            {
+                output.push_str(&args.all);
+                idx += 1 + ARGUMENTS_TOKEN.len();
+                handled = true;
+            } else {
+                let mut digit_end = idx + 1;
+                while digit_end < bytes.len() && bytes[digit_end].is_ascii_digit() {
+                    digit_end += 1;
+                }
+                if digit_end > idx + 1 {
+                    if let Ok(position) = template[idx + 1..digit_end].parse::<usize>() {
+                        let replacement = if position == 0 {
+                            ""
+                        } else {
+                            args.positional
+                                .get(position - 1)
+                                .map(|s| s.as_str())
+                                .unwrap_or("")
+                        };
+                        output.push_str(replacement);
+                        idx = digit_end;
+                        handled = true;
+                    }
+                }
+            }
+
+            if handled {
+                continue;
+            }
+
+            output.push('$');
+            idx += 1;
+        } else {
+            let ch = template[idx..].chars().next().unwrap();
+            output.push(ch);
+            idx += ch.len_utf8();
+        }
+    }
+
+    output
+}
+
 impl WidgetRef for ChatComposer {
     fn render_ref(&self, area: Rect, buf: &mut Buffer) {
         let (popup_constraint, hint_spacing) = match &self.active_popup {
@@ -2056,6 +2218,96 @@ mod tests {
         assert!(composer.textarea.is_empty(), "composer should be cleared");
         composer.insert_str("@");
         assert_eq!(composer.textarea.text(), "@");
+    }
+
+    #[test]
+    fn slash_prompt_substitutes_all_arguments() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        composer.set_custom_prompts(vec![CustomPrompt {
+            name: "fix-issue".to_string(),
+            path: PathBuf::from("/tmp/fix-issue.md"),
+            content: "Fix issue #$ARGUMENTS".to_string(),
+        }]);
+
+        type_chars_humanlike(
+            &mut composer,
+            &[
+                '/', 'f', 'i', 'x', '-', 'i', 's', 's', 'u', 'e', ' ', '1', '2', '3', ' ', 'h',
+                'i', 'g', 'h', '-', 'p', 'r', 'i', 'o', 'r', 'i', 't', 'y',
+            ],
+        );
+
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        match result {
+            InputResult::Submitted(text) => {
+                assert_eq!(text, "Fix issue #123 high-priority");
+            }
+            other => panic!("expected submitted prompt, got {other:?}"),
+        }
+        assert!(
+            composer.textarea.is_empty(),
+            "composer should clear after submit"
+        );
+    }
+
+    #[test]
+    fn slash_prompt_substitutes_positional_arguments() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        composer.set_custom_prompts(vec![CustomPrompt {
+            name: "review-pr".to_string(),
+            path: PathBuf::from("/tmp/review-pr.md"),
+            content: "Review PR #$1 with priority $2 and assign to $3. Remaining: $ARGUMENTS"
+                .to_string(),
+        }]);
+
+        type_chars_humanlike(
+            &mut composer,
+            &[
+                '/', 'r', 'e', 'v', 'i', 'e', 'w', '-', 'p', 'r', ' ', '4', '5', '6', ' ', 'h',
+                'i', 'g', 'h', ' ', 'a', 'l', 'i', 'c', 'e',
+            ],
+        );
+
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        match result {
+            InputResult::Submitted(text) => {
+                assert_eq!(
+                    text,
+                    "Review PR #456 with priority high and assign to alice. Remaining: 456 high alice",
+                );
+            }
+            other => panic!("expected submitted prompt, got {other:?}"),
+        }
     }
 
     #[test]
