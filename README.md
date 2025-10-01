@@ -20,19 +20,13 @@
 Install globally with your preferred package manager. If you use npm:
 
 ```shell
-npm install -g @openai/codex
+npm install -g @lavdata/codex
 ```
 
-Alternatively, if you use Homebrew:
+Then simply run `pidex` to get started:
 
 ```shell
-brew install codex
-```
-
-Then simply run `codex` to get started:
-
-```shell
-codex
+pidex
 ```
 
 <details>

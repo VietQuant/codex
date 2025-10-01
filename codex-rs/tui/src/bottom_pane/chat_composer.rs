@@ -67,6 +67,13 @@ struct PromptArguments {
     positional: Vec<String>,
 }
 
+#[derive(Debug)]
+struct AppliedPrompt {
+    text: String,
+    used_all_arguments: bool,
+    positional_used: Vec<bool>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct AttachedImage {
     placeholder: String,
@@ -481,7 +488,42 @@ impl ChatComposer {
                                     &command_line,
                                     prompt_name.as_deref(),
                                 );
-                                let filled = apply_prompt_arguments(&contents, &args);
+                                let applied = apply_prompt_arguments(&contents, &args);
+                                let mut filled = applied.text;
+
+                                if !applied.used_all_arguments {
+                                    let leftovers = args
+                                        .positional
+                                        .iter()
+                                        .enumerate()
+                                        .filter_map(|(idx, token)| {
+                                            let used = applied
+                                                .positional_used
+                                                .get(idx)
+                                                .copied()
+                                                .unwrap_or(false);
+                                            if used || token.is_empty() {
+                                                None
+                                            } else {
+                                                Some(token.as_str())
+                                            }
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(" ");
+
+                                    if !leftovers.is_empty() {
+                                        let needs_space = filled
+                                            .chars()
+                                            .last()
+                                            .map(|c| !c.is_whitespace())
+                                            .unwrap_or(false);
+                                        if needs_space && !filled.is_empty() {
+                                            filled.push(' ');
+                                        }
+                                        filled.push_str(&leftovers);
+                                    }
+                                }
+
                                 return (InputResult::Submitted(filled), true);
                             }
                             return (InputResult::None, true);
@@ -1463,9 +1505,11 @@ fn split_prompt_arguments(input: &str) -> Vec<String> {
     result
 }
 
-fn apply_prompt_arguments(template: &str, args: &PromptArguments) -> String {
+fn apply_prompt_arguments(template: &str, args: &PromptArguments) -> AppliedPrompt {
     const ARGUMENTS_TOKEN: &str = "ARGUMENTS";
     let mut output = String::with_capacity(template.len() + args.all.len());
+    let mut positional_used = vec![false; args.positional.len()];
+    let mut used_all_arguments = false;
     let bytes = template.as_bytes();
     let mut idx = 0;
 
@@ -1477,6 +1521,7 @@ fn apply_prompt_arguments(template: &str, args: &PromptArguments) -> String {
             {
                 output.push_str(&args.all);
                 idx += 1 + ARGUMENTS_TOKEN.len();
+                used_all_arguments = true;
                 handled = true;
             } else {
                 let mut digit_end = idx + 1;
@@ -1488,10 +1533,13 @@ fn apply_prompt_arguments(template: &str, args: &PromptArguments) -> String {
                         let replacement = if position == 0 {
                             ""
                         } else {
-                            args.positional
-                                .get(position - 1)
-                                .map(|s| s.as_str())
-                                .unwrap_or("")
+                            let token_index = position.saturating_sub(1);
+                            if let Some(token) = args.positional.get(token_index) {
+                                positional_used[token_index] = true;
+                                token.as_str()
+                            } else {
+                                ""
+                            }
                         };
                         output.push_str(replacement);
                         idx = digit_end;
@@ -1513,7 +1561,11 @@ fn apply_prompt_arguments(template: &str, args: &PromptArguments) -> String {
         }
     }
 
-    output
+    AppliedPrompt {
+        text: output,
+        used_all_arguments,
+        positional_used,
+    }
 }
 
 impl WidgetRef for ChatComposer {
@@ -2305,6 +2357,92 @@ mod tests {
                     text,
                     "Review PR #456 with priority high and assign to alice. Remaining: 456 high alice",
                 );
+            }
+            other => panic!("expected submitted prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_prompt_appends_unreferenced_arguments() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        composer.set_custom_prompts(vec![CustomPrompt {
+            name: "review-pr".to_string(),
+            path: PathBuf::from("/tmp/review-pr.md"),
+            content: "Review PR #$1 with priority $2 and assign to $3.".to_string(),
+        }]);
+
+        type_chars_humanlike(
+            &mut composer,
+            &[
+                '/', 'r', 'e', 'v', 'i', 'e', 'w', '-', 'p', 'r', ' ', '4', '5', '6', ' ', 'h',
+                'i', 'g', 'h', ' ', 'a', 'l', 'i', 'c', 'e', ' ', 'a', 'n', 'd', ' ', 's', 'a',
+                'y', ' ', 'h', 'e', 'h', 'e',
+            ],
+        );
+
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        match result {
+            InputResult::Submitted(text) => {
+                assert_eq!(
+                    text,
+                    "Review PR #456 with priority high and assign to alice. and say hehe",
+                );
+            }
+            other => panic!("expected submitted prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_prompt_without_placeholders_appends_arguments() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        composer.set_custom_prompts(vec![CustomPrompt {
+            name: "summary".to_string(),
+            path: PathBuf::from("/tmp/summary.md"),
+            content: "Please summarize the following:".to_string(),
+        }]);
+
+        type_chars_humanlike(
+            &mut composer,
+            &[
+                '/', 's', 'u', 'm', 'm', 'a', 'r', 'y', ' ', 'f', 'o', 'c', 'u', 's', ' ', 'o',
+                'n', ' ', 't', 'h', 'e', ' ', 't', 'e', 's', 't', 's',
+            ],
+        );
+
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        match result {
+            InputResult::Submitted(text) => {
+                assert_eq!(text, "Please summarize the following: focus on the tests",);
             }
             other => panic!("expected submitted prompt, got {other:?}"),
         }

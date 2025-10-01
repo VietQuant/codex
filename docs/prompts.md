@@ -12,6 +12,7 @@ Save frequently used prompts as Markdown files and reuse them quickly from the s
   - `$ARGUMENTS` expands to everything after the command token (trimmed of leading/trailing whitespace).
   - `$1`, `$2`, … expand to individual space-separated arguments; wrap text in quotes to keep spaces inside a single argument.
   - Placeholders with no matching argument expand to an empty string.
+  - If you type additional words that aren’t consumed by placeholders, they’re appended to the end of the prompt automatically (unless `$ARGUMENTS` is present).
 - How to use:
   - Start a new session (Codex loads custom prompts on session start).
   - In the composer, type `/` to open the slash popup and begin typing your prompt name.

@@ -5,6 +5,8 @@
 //! from the current workspace context.
 
 use crate::error::Result;
+use crate::protocol::SandboxPolicy;
+use codex_protocol::config_types::ReasoningEffort as ReasoningEffortConfig;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -27,6 +29,14 @@ pub struct AgentConfig {
     /// Optional: Override tools (usually inherits from context)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
+
+    /// Optional: Override model (usually inherits from context)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    /// Optional: Override reasoning effort (usually inherits from context)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffortConfig>,
 
     /// Optional: Override permissions (usually inherits from context)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -72,6 +82,39 @@ impl AgentConfig {
         } else {
             Err(anyhow::anyhow!("No prompt or prompt_file specified"))
         }
+    }
+
+    /// Return the sandbox policy override configured for this agent, if any.
+    pub fn permissions_policy(&self) -> anyhow::Result<Option<SandboxPolicy>> {
+        let Some(raw) = self.permissions.as_ref() else {
+            return Ok(None);
+        };
+
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("inherit") {
+            return Ok(None);
+        }
+
+        parse_permissions_policy(trimmed)
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("invalid permissions override '{trimmed}': {e}"))
+    }
+
+    /// Return the requested model override, trimmed and validated.
+    pub fn model_override(&self) -> Option<String> {
+        self.model.as_ref().and_then(|m| {
+            let trimmed = m.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+    }
+
+    /// Return the requested reasoning effort override.
+    pub fn reasoning_effort_override(&self) -> Option<ReasoningEffortConfig> {
+        self.reasoning_effort
     }
 }
 
@@ -131,6 +174,8 @@ impl AgentRegistry {
                 prompt: Some("You are a helpful AI assistant. Complete the given task efficiently and accurately.".to_string()),
                 prompt_file: None,
                 tools: None,
+                model: None,
+                reasoning_effort: None,
                 permissions: None,
             }
         );
@@ -162,10 +207,27 @@ impl AgentRegistry {
                     if let Ok(safe_path) = AgentRegistry::validate_prompt_path(root, prompt_file) {
                         if let Ok(prompt) = std::fs::read_to_string(&safe_path) {
                             config.prompt = Some(prompt);
-                            parsed.insert(name.clone(), config);
                         }
                     }
                 }
+                if let Some(model) = config.model.as_mut() {
+                    if model.trim().is_empty() {
+                        config.model = None;
+                    } else {
+                        *model = model.trim().to_string();
+                    }
+                }
+                // Ensure any permissions override is valid; fall back to inherited on error.
+                if config.permissions.is_some() {
+                    if let Err(e) = config.permissions_policy() {
+                        tracing::warn!(
+                            "Invalid permissions override for agent '{}': {e}. Falling back to inherited permissions.",
+                            name
+                        );
+                        config.permissions = None;
+                    }
+                }
+                parsed.insert(name.clone(), config);
             }
             for (k, v) in parsed {
                 out.insert(k, v);
@@ -250,6 +312,27 @@ impl AgentRegistry {
         });
 
         agents
+    }
+
+    /// Return the sandbox override configured for the provided agent, if any.
+    pub fn permissions_policy(&self, agent_name: &str) -> Option<SandboxPolicy> {
+        self.agents
+            .get(agent_name)
+            .and_then(|cfg| cfg.permissions_policy().ok().flatten())
+    }
+
+    /// Return the model override configured for the provided agent, if any.
+    pub fn model_override(&self, agent_name: &str) -> Option<String> {
+        self.agents
+            .get(agent_name)
+            .and_then(|cfg| cfg.model_override())
+    }
+
+    /// Return the reasoning effort override for the provided agent, if any.
+    pub fn reasoning_effort_override(&self, agent_name: &str) -> Option<ReasoningEffortConfig> {
+        self.agents
+            .get(agent_name)
+            .and_then(|cfg| cfg.reasoning_effort_override())
     }
 
     /// Extract brief description from prompt
@@ -355,6 +438,8 @@ mod tests {
             prompt: Some("Test prompt".to_string()),
             prompt_file: None,
             tools: None,
+            model: None,
+            reasoning_effort: None,
             permissions: None,
         };
         assert!(config.validate().is_ok());
@@ -364,6 +449,8 @@ mod tests {
             prompt: None,
             prompt_file: Some("test.txt".to_string()),
             tools: None,
+            model: None,
+            reasoning_effort: None,
             permissions: None,
         };
         assert!(config.validate().is_ok());
@@ -373,6 +460,8 @@ mod tests {
             prompt: None,
             prompt_file: None,
             tools: None,
+            model: None,
+            reasoning_effort: None,
             permissions: None,
         };
         assert!(config.validate().is_err());
@@ -382,6 +471,8 @@ mod tests {
             prompt: Some("Test prompt".to_string()),
             prompt_file: Some("test.txt".to_string()),
             tools: None,
+            model: None,
+            reasoning_effort: None,
             permissions: None,
         };
         assert!(config.validate().is_err());
@@ -394,6 +485,8 @@ mod tests {
             prompt: Some("Inline prompt".to_string()),
             prompt_file: None,
             tools: None,
+            model: None,
+            reasoning_effort: None,
             permissions: None,
         };
         assert_eq!(config.get_prompt(None).unwrap(), "Inline prompt");
@@ -407,6 +500,8 @@ mod tests {
             prompt: None,
             prompt_file: Some("test_prompt.txt".to_string()),
             tools: None,
+            model: None,
+            reasoning_effort: None,
             permissions: None,
         };
 
@@ -415,5 +510,129 @@ mod tests {
 
         // Check that prompt is cached
         assert_eq!(config.prompt, Some("File-based prompt".to_string()));
+    }
+
+    #[test]
+    fn permissions_policy_parses_supported_values() {
+        let config = AgentConfig {
+            prompt: Some("Inline".to_string()),
+            prompt_file: None,
+            tools: None,
+            model: None,
+            reasoning_effort: None,
+            permissions: Some("read-only".to_string()),
+        };
+        assert!(matches!(
+            config.permissions_policy().unwrap().unwrap(),
+            SandboxPolicy::ReadOnly
+        ));
+
+        let config = AgentConfig {
+            prompt: Some("Inline".to_string()),
+            prompt_file: None,
+            tools: None,
+            model: None,
+            reasoning_effort: None,
+            permissions: Some("workspace-write+network".to_string()),
+        };
+        match config.permissions_policy().unwrap().unwrap() {
+            SandboxPolicy::WorkspaceWrite { network_access, .. } => assert!(network_access),
+            other => panic!("expected workspace-write override, got {other:?}"),
+        }
+
+        let config = AgentConfig {
+            prompt: Some("Inline".to_string()),
+            prompt_file: None,
+            tools: None,
+            model: None,
+            reasoning_effort: None,
+            permissions: Some("danger-full-access".to_string()),
+        };
+        assert!(matches!(
+            config.permissions_policy().unwrap().unwrap(),
+            SandboxPolicy::DangerFullAccess
+        ));
+
+        let config = AgentConfig {
+            prompt: Some("Inline".to_string()),
+            prompt_file: None,
+            tools: None,
+            model: None,
+            reasoning_effort: None,
+            permissions: Some("inherit".to_string()),
+        };
+        assert!(config.permissions_policy().unwrap().is_none());
+    }
+
+    #[test]
+    fn permissions_policy_rejects_unknown_values() {
+        let config = AgentConfig {
+            prompt: Some("Inline".to_string()),
+            prompt_file: None,
+            tools: None,
+            model: None,
+            reasoning_effort: None,
+            permissions: Some("totally-unknown".to_string()),
+        };
+        assert!(config.permissions_policy().is_err());
+    }
+
+    #[test]
+    fn model_override_trims_whitespace() {
+        let config = AgentConfig {
+            prompt: Some("Inline".to_string()),
+            prompt_file: None,
+            tools: None,
+            model: Some("  gpt-4o-mini  ".to_string()),
+            reasoning_effort: None,
+            permissions: None,
+        };
+        assert_eq!(config.model_override(), Some("gpt-4o-mini".to_string()));
+
+        let config = AgentConfig {
+            prompt: Some("Inline".to_string()),
+            prompt_file: None,
+            tools: None,
+            model: Some("   ".to_string()),
+            reasoning_effort: None,
+            permissions: None,
+        };
+        assert!(config.model_override().is_none());
+    }
+
+    #[test]
+    fn reasoning_effort_override_is_returned() {
+        let config = AgentConfig {
+            prompt: Some("Inline".to_string()),
+            prompt_file: None,
+            tools: None,
+            model: None,
+            reasoning_effort: Some(ReasoningEffortConfig::High),
+            permissions: None,
+        };
+        assert_eq!(
+            config.reasoning_effort_override(),
+            Some(ReasoningEffortConfig::High)
+        );
+    }
+}
+
+fn parse_permissions_policy(value: &str) -> anyhow::Result<SandboxPolicy> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "read-only" | "readonly" => Ok(SandboxPolicy::ReadOnly),
+        "danger-full-access" | "dangerfullaccess" => Ok(SandboxPolicy::DangerFullAccess),
+        "workspace-write" | "workspacewrite" => Ok(SandboxPolicy::new_workspace_write_policy()),
+        "workspace-write+network"
+        | "workspace-write-network"
+        | "workspace-write:network"
+        | "workspacewrite+network" => {
+            let mut policy = SandboxPolicy::new_workspace_write_policy();
+            if let SandboxPolicy::WorkspaceWrite { network_access, .. } = &mut policy {
+                *network_access = true;
+            }
+            Ok(policy)
+        }
+        other => Err(anyhow::anyhow!("unknown permissions value '{other}'")),
     }
 }

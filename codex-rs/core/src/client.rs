@@ -381,6 +381,10 @@ impl ModelClient {
         self.provider.clone()
     }
 
+    pub fn config(&self) -> Arc<Config> {
+        Arc::clone(&self.config)
+    }
+
     /// Returns the currently configured model slug.
     pub fn get_model(&self) -> String {
         self.config.model.clone()

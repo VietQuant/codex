@@ -121,18 +121,27 @@ You are a documentation expert. Your tasks:
 - Add helpful diagrams when appropriate
 """
 permissions = "readonly"  # Optional: override permissions
+# model = "gpt-4o-mini"    # Optional: override model
+# reasoning_effort = "low"  # Optional: override reasoning effort (minimal|low|medium|high)
 ```
+
+The `permissions` override accepts the same sandbox strings as Codex itself: `readonly`, `workspace-write`, `workspace-write+network`, `danger-full-access`, or `inherit` (default). Invalid values are ignored and fall back to the session sandbox.
+You can also set `model = "gpt-4o-mini"` (or any other slug supported by your provider) to force that agent to run with a different model while inheriting the same provider credentials.
+Similarly, `reasoning_effort` lets you pin the model's effort to `minimal`, `low`, `medium`, or `high` for that agent only.
+
 
 ## Configuration Options
 
 Each agent supports the following configuration options:
 
-| Field         | Type   | Description                                                           |
-| ------------- | ------ | --------------------------------------------------------------------- |
-| `prompt`      | String | The system prompt that defines the agent's behavior                   |
-| `prompt_file` | String | Path to a file containing the prompt (alternative to inline `prompt`) |
-| `tools`       | Array  | Optional: Override the available tools for this agent                 |
-| `permissions` | String | Optional: Override the permission level for this agent                |
+| Field               | Type   | Description                                                           |
+| ------------------- | ------ | --------------------------------------------------------------------- |
+| `prompt`            | String | The system prompt that defines the agent's behavior                   |
+| `prompt_file`       | String | Path to a file containing the prompt (alternative to inline `prompt`) |
+| `tools`             | Array  | Optional: Override the available tools for this agent                 |
+| `model`             | String | Optional: Override the model slug (defaults to session model)         |
+| `reasoning_effort`  | String | Optional: Override reasoning effort (`minimal`, `low`, `medium`, `high`)|
+| `permissions`       | String | Optional: Override the permission level for this agent                |
 
 ### Prompt Files
 

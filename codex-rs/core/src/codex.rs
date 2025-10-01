@@ -73,6 +73,7 @@ use crate::exec_command::WriteStdinParams;
 use crate::exec_env::create_env;
 use crate::mcp_connection_manager::McpConnectionManager;
 use crate::mcp_tool_call::handle_mcp_tool_call;
+use crate::model_family::derive_default_model_family;
 use crate::model_family::find_family_for_model;
 use crate::openai_model_info::get_model_info;
 use crate::openai_tools::ApplyPatchToolArgs;
@@ -2988,6 +2989,9 @@ async fn execute_agents_concurrent_safe(
 
                 let agent_name = args.agent.unwrap_or_else(|| "general".to_string());
                 let agent_system_prompt = registry_clone.get_system_prompt(&agent_name);
+                let sandbox_override = registry_clone.permissions_policy(&agent_name);
+                let model_override = registry_clone.model_override(&agent_name);
+                let reasoning_override = registry_clone.reasoning_effort_override(&agent_name);
 
                 // Build the agent's task message (what the user is asking)
                 let agent_task_message =
@@ -3004,6 +3008,9 @@ async fn execute_agents_concurrent_safe(
                         agent_name: agent_name.clone(),
                         task_message: agent_task_message,
                         agent_system_prompt: agent_system_prompt.clone(),
+                        sandbox_override,
+                        model_override,
+                        reasoning_override,
                         call_id: call_id.clone(),
                         _plan_item_id: Some(plan_item_id),
                     },
@@ -3052,6 +3059,9 @@ struct AgentExecutionParams {
     agent_name: String,
     task_message: String,
     agent_system_prompt: String,
+    sandbox_override: Option<SandboxPolicy>,
+    model_override: Option<String>,
+    reasoning_override: Option<ReasoningEffortConfig>,
     call_id: String,
     _plan_item_id: Option<String>,
 }
@@ -3075,17 +3085,44 @@ async fn execute_agent_non_streaming(
         params.agent_name, params.call_id
     );
 
-    // Send agent start event to UI for status display
-    sess.send_event(Event {
-        id: params.sub_id.clone(),
-        msg: EventMsg::BackgroundEvent(BackgroundEventEvent {
-            message: format!(
-                "🤖 Agent '{}' started: {}",
-                params.agent_name, params.task_message
-            ),
-        }),
-    })
-    .await;
+    let parent_client = parent_context.client.clone();
+    let mut model_note: Option<String> = None;
+    let mut effort_note: Option<String> = None;
+    let need_new_client = params.model_override.is_some() || params.reasoning_override.is_some();
+
+    let client = if need_new_client {
+        match build_agent_client(
+            sess,
+            parent_context,
+            params.model_override.as_deref(),
+            params.reasoning_override,
+        ) {
+            Ok((client, model_slug, effort)) => {
+                model_note = model_slug.map(|m| format!("model: {m}"));
+                effort_note = effort.map(|e| format!("effort: {}", stringify_effort(e)));
+                client
+            }
+            Err(err) => {
+                warn!(
+                    "Agent '{}' override failed: {err}; falling back to session model",
+                    params.agent_name
+                );
+                sess.send_event(Event {
+                    id: params.sub_id.clone(),
+                    msg: EventMsg::BackgroundEvent(BackgroundEventEvent {
+                        message: format!(
+                            "⚠️ Agent '{}' overrides failed: {err}. Using session defaults instead.",
+                            params.agent_name
+                        ),
+                    }),
+                })
+                .await;
+                parent_client.clone()
+            }
+        }
+    } else {
+        parent_client.clone()
+    };
 
     // Build agent's custom instructions: agent system prompt + AGENTS.md
     let mut agent_custom_instructions = String::new();
@@ -3109,11 +3146,52 @@ async fn execute_agent_non_streaming(
     // base_instructions: Keep parent's base instructions (default Codex instructions)
     // user_instructions: Agent system prompt + AGENTS.md
     // IMPORTANT: Disable agent tool for agents to prevent recursion
+    let sandbox_policy = params
+        .sandbox_override
+        .clone()
+        .unwrap_or_else(|| parent_context.sandbox_policy.clone());
+
+    let mut context_notes: Vec<String> = Vec::new();
+    if let Some(note) = model_note.clone() {
+        context_notes.push(note);
+    }
+    if let Some(note) = effort_note.clone() {
+        context_notes.push(note);
+    }
+    if params.sandbox_override.is_some() {
+        context_notes.push(format!(
+            "sandbox: {}",
+            sandbox_policy_label(&sandbox_policy)
+        ));
+    }
+    let context_suffix = if context_notes.is_empty() {
+        String::new()
+    } else {
+        let decorated = context_notes
+            .into_iter()
+            .map(|n| format!("[{n}]"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(" {decorated}")
+    };
+
+    // Send agent start event to UI for status display (after resolving sandbox override).
+    sess.send_event(Event {
+        id: params.sub_id.clone(),
+        msg: EventMsg::BackgroundEvent(BackgroundEventEvent {
+            message: format!(
+                "🤖 Agent '{}' started: {}{}",
+                params.agent_name, params.task_message, context_suffix
+            ),
+        }),
+    })
+    .await;
+
     let mut agent_tools_config = parent_context.tools_config.clone();
     agent_tools_config.include_agent_tool = false; // Prevent agents from spawning other agents
 
     let agent_turn_context = TurnContext {
-        client: parent_context.client.clone(),
+        client,
         tools_config: agent_tools_config,
         base_instructions: parent_context.base_instructions.clone(), // Keep default base instructions
         user_instructions: if agent_custom_instructions.is_empty() {
@@ -3122,7 +3200,7 @@ async fn execute_agent_non_streaming(
             Some(agent_custom_instructions)
         }, // Agent prompt + AGENTS.md
         approval_policy: parent_context.approval_policy,
-        sandbox_policy: parent_context.sandbox_policy.clone(),
+        sandbox_policy,
         shell_environment_policy: parent_context.shell_environment_policy.clone(),
         cwd: parent_context.cwd.clone(),
         is_review_mode: true,
@@ -3279,8 +3357,8 @@ async fn execute_agent_non_streaming(
     // Send completion status message
     let status_msg = if agent_response.is_empty() {
         format!(
-            "❌ Agent '{}' failed: No response generated",
-            params.agent_name
+            "❌ Agent '{}' failed: No response generated{}",
+            params.agent_name, context_suffix
         )
     } else {
         let preview = if agent_response.len() > 100 {
@@ -3289,10 +3367,11 @@ async fn execute_agent_non_streaming(
             agent_response.clone()
         };
         format!(
-            "✅ Agent '{}' completed in {:.2}s: {}",
+            "✅ Agent '{}' completed in {:.2}s: {}{}",
             params.agent_name,
             duration.as_secs_f64(),
-            preview.trim().replace('\n', " ")
+            preview.trim().replace('\n', " "),
+            context_suffix
         )
     };
 
@@ -3305,6 +3384,85 @@ async fn execute_agent_non_streaming(
     .await;
 
     (Ok(agent_response), turn_diff_tracker)
+}
+
+fn build_agent_client(
+    sess: &Session,
+    parent_context: &TurnContext,
+    model_override: Option<&str>,
+    effort_override: Option<ReasoningEffortConfig>,
+) -> Result<(ModelClient, Option<String>, Option<ReasoningEffortConfig>), String> {
+    let parent_client = parent_context.client.clone();
+    let parent_config = parent_client.config();
+    let mut config = (*parent_config).clone();
+
+    let applied_model = model_override.and_then(|slug| {
+        let trimmed = slug.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            config.model = trimmed.to_string();
+            let model_family = find_family_for_model(trimmed)
+                .unwrap_or_else(|| derive_default_model_family(trimmed));
+            config.model_family = model_family.clone();
+            if let Some(info) = get_model_info(&model_family) {
+                config.model_context_window = Some(info.context_window);
+                config.model_max_output_tokens = Some(info.max_output_tokens);
+                config.model_auto_compact_token_limit = info.auto_compact_token_limit;
+            }
+            Some(trimmed.to_string())
+        }
+    });
+
+    if let Some(effort) = effort_override {
+        config.model_reasoning_effort = Some(effort);
+    }
+
+    let provider_id = config.model_provider_id.clone();
+    let provider = config
+        .model_providers
+        .get(&provider_id)
+        .cloned()
+        .ok_or_else(|| format!("model provider `{provider_id}` not found"))?;
+    config.model_provider = provider.clone();
+
+    let arc_config = Arc::new(config);
+    let effort = effort_override.or_else(|| parent_client.get_reasoning_effort());
+    let summary = parent_client.get_reasoning_summary();
+
+    let client = ModelClient::new(
+        arc_config,
+        parent_client.get_auth_manager(),
+        provider,
+        effort,
+        summary,
+        sess.conversation_id,
+    );
+
+    Ok((client, applied_model, effort_override))
+}
+
+fn stringify_effort(effort: ReasoningEffortConfig) -> &'static str {
+    match effort {
+        ReasoningEffortConfig::Minimal => "minimal",
+        ReasoningEffortConfig::Low => "low",
+        ReasoningEffortConfig::Medium => "medium",
+        ReasoningEffortConfig::High => "high",
+    }
+}
+
+fn sandbox_policy_label(policy: &SandboxPolicy) -> &'static str {
+    match policy {
+        SandboxPolicy::DangerFullAccess => "danger-full-access",
+        SandboxPolicy::ReadOnly => "read-only",
+        SandboxPolicy::WorkspaceWrite { network_access, .. } => {
+            if *network_access {
+                "workspace-write (network)"
+            } else {
+                "workspace-write"
+            }
+        }
+    }
 }
 
 /// Generate a comprehensive summary of agent execution
